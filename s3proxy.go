@@ -1,21 +1,19 @@
 package caddys3proxy
 
 import (
-	"bytes"
-	"errors"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"html/template"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"path"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/caddyserver/caddy/v2"
@@ -164,12 +162,12 @@ func (p *S3Proxy) Provision(ctx caddy.Context) (err error) {
 	return nil
 }
 
-func (p S3Proxy) getS3Object(bucket string, path string, headers http.Header) (*s3.GetObjectOutput, error) {
+func (p S3Proxy) getS3Object(bucket string, key string, r *http.Request, w http.ResponseWriter) (*s3.GetObjectOutput, error) {
 	oi := &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
-		Key:    aws.String(path),
+		Key:    aws.String(key),
 	}
-
+	headers := r.Header
 	if rg := headers.Get("Range"); rg != "" {
 		oi = oi.SetRange(rg)
 	}
@@ -192,14 +190,61 @@ func (p S3Proxy) getS3Object(bucket string, path string, headers http.Header) (*
 		}
 	}
 
-	p.log.Debug("get from S3",
+	p.log.Debug("cache:attempt",
 		zap.String("bucket", bucket),
-		zap.String("key", path),
+		zap.String("key", key),
 	)
 
-	// TODO: GetObject could return the aws error InternalError, if that happens it is best practice to retry the
-	// the call.  That retry logic should go here...
-	return p.client.GetObject(oi)
+	//
+	obj, err := p.client.GetObject(oi)
+
+	if err != nil {
+		// Make the err a caddyErr if it is not already
+		awsErr, isAwsErr := err.(awserr.Error)
+
+		if isAwsErr {
+			switch awsErr.Code() {
+			case "NotModified":
+				p.log.Debug("cache:hit",
+					zap.String("bucket", bucket),
+					zap.String("key", key),
+					zap.String("code", awsErr.Code()),
+				)
+				w.WriteHeader(304)
+				return obj, nil
+			case "NoSuchKey":
+				p.log.Debug("cache:miss",
+					zap.String("bucket", bucket),
+					zap.String("key", key),
+					zap.String("code", awsErr.Code()),
+					zap.String("error", awsErr.Error()),
+				)
+			default:
+				p.log.Error("cache:fail",
+					zap.String("bucket", bucket),
+					zap.String("key", key),
+					zap.String("code", awsErr.Code()),
+					zap.String("error", awsErr.Error()),
+				)
+			}
+
+		} else {
+			p.log.Error("cache:fail",
+				zap.String("bucket", bucket),
+				zap.String("key", key),
+				zap.String("error", err.Error()),
+			)
+		}
+
+		return obj, err
+	}
+
+	p.log.Debug("cache:hit",
+		zap.String("bucket", bucket),
+		zap.String("key", key),
+	)
+
+	return obj, nil
 }
 
 func joinPath(root string, uriPath string) string {
@@ -211,96 +256,6 @@ func joinPath(root string, uriPath string) string {
 		return newPath + "/"
 	}
 	return newPath
-}
-
-func makeAwsString(str string) *string {
-	if str == "" {
-		return nil
-	}
-	return aws.String(str)
-}
-
-func (p S3Proxy) PutHandler(w http.ResponseWriter, r *http.Request, key string) error {
-	isDir := strings.HasSuffix(key, "/")
-	if isDir || !p.EnablePut {
-		err := errors.New("method not allowed")
-		return caddyhttp.Error(http.StatusMethodNotAllowed, err)
-	}
-
-	// The request gives us r.Body a ReadCloser.  However, Put needs a ReadSeeker.
-	// So we need to read the entire object in memory and create the ReadSeeker.
-	// TODO: this will not work well for very large files - will run out of memory
-	buf, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return convertToCaddyError(err)
-	}
-
-	oi := s3.PutObjectInput{
-		Bucket:             aws.String(p.Bucket),
-		Key:                aws.String(key),
-		CacheControl:       makeAwsString(r.Header.Get("Cache-Control")),
-		ContentDisposition: makeAwsString(r.Header.Get("Content-Disposition")),
-		ContentEncoding:    makeAwsString(r.Header.Get("Content-Encoding")),
-		ContentLanguage:    makeAwsString(r.Header.Get("Content-Language")),
-		ContentType:        makeAwsString(r.Header.Get("Content-Type")),
-		Body:               bytes.NewReader(buf),
-	}
-	po, err := p.client.PutObject(&oi)
-	if err != nil {
-		return convertToCaddyError(err)
-	}
-
-	setStrHeader(w, "ETag", po.ETag)
-
-	return nil
-}
-
-func (p S3Proxy) DeleteHandler(w http.ResponseWriter, r *http.Request, key string) error {
-	isDir := strings.HasSuffix(key, "/")
-	if isDir || !p.EnableDelete {
-		err := errors.New("method not allowed")
-		return caddyhttp.Error(http.StatusMethodNotAllowed, err)
-	}
-
-	di := s3.DeleteObjectInput{
-		Bucket: aws.String(p.Bucket),
-		Key:    aws.String(key),
-	}
-	_, err := p.client.DeleteObject(&di)
-	if err != nil {
-		return convertToCaddyError(err)
-	}
-
-	return nil
-}
-
-func (p S3Proxy) BrowseHandler(w http.ResponseWriter, r *http.Request, key string) error {
-
-	input := p.ConstructListObjInput(r, key)
-
-	result, err := p.client.ListObjectsV2(&input)
-	if err != nil {
-		p.log.Debug("error in ListObjectsV2",
-			zap.String("bucket", p.Bucket),
-			zap.String("key", key),
-			zap.String("err", err.Error()),
-		)
-		return convertToCaddyError(err)
-	}
-
-	pageObj := p.MakePageObj(result)
-
-	if r.Header.Get("Content-type") == "application/json" {
-		// Give JSON output of dir
-		err = pageObj.GenerateJson(w)
-	} else {
-		// Generate html response of dir
-		err = pageObj.GenerateHtml(w, p.dirTemplate)
-	}
-	if err != nil {
-		return convertToCaddyError(err)
-	}
-	return nil
 }
 
 func (p S3Proxy) writeResponseFromGetObject(w http.ResponseWriter, obj *s3.GetObjectOutput) error {
@@ -320,6 +275,8 @@ func (p S3Proxy) writeResponseFromGetObject(w http.ResponseWriter, obj *s3.GetOb
 		setStrHeader(w, key, value)
 	}
 
+	w.Header().Set("X-Cache-S3", "hit")
+
 	var err error
 	if obj.Body != nil {
 		// io.Copy will set Content-Length
@@ -330,233 +287,75 @@ func (p S3Proxy) writeResponseFromGetObject(w http.ResponseWriter, obj *s3.GetOb
 	return err
 }
 
-func (p S3Proxy) serveErrorPage(w http.ResponseWriter, s3Key string) error {
-	obj, err := p.getS3Object(p.Bucket, s3Key, nil)
-	if err != nil {
-		return err
-	}
-
-	if err := p.writeResponseFromGetObject(w, obj); err != nil {
-		return err
-	}
-
-	return nil
-}
-
 // ServeHTTP implements the main entry point for a request for the caddyhttp.Handler interface.
 func (p S3Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	p.log.Debug("incoming request",
+		zap.String("r.method", r.Method),
+		zap.String("r.URL.path", r.URL.Path),
+		zap.String("r.URL.RawQuery", r.URL.RawQuery),
+	)
 
-	fullPath := joinPath(repl.ReplaceAll(p.Root, ""), r.URL.Path)
+	if r.Method != http.MethodGet { // As of now only support GET requests
+		p.log.Debug("cache:miss",
+			zap.String("r.method", r.Method),
+			zap.String("r.URL.path", r.URL.Path),
+			zap.String("r.URL.RawQuery", r.URL.RawQuery),
+			zap.String("message", "method not allowed"),
+		)
 
-	var err error
-	switch r.Method {
-	case http.MethodGet:
-		err = p.GetHandler(w, r, fullPath)
-	case http.MethodPut:
-		err = p.PutHandler(w, r, fullPath)
-	case http.MethodDelete:
-		err = p.DeleteHandler(w, r, fullPath)
-	default:
-		err = caddyhttp.Error(http.StatusMethodNotAllowed, errors.New("method not allowed"))
-	}
-	if err == nil {
-		// Success!
-		return nil
-	}
-
-	// Make the err a caddyErr if it is not already
-	caddyErr, isCaddyErr := err.(caddyhttp.HandlerError)
-	if !isCaddyErr {
-		caddyErr = caddyhttp.Error(http.StatusInternalServerError, err)
-	}
-
-	// If non OK status code - WriteHeader - except for GET method, where we still need to process more
-	if r.Method != http.MethodGet {
-		if caddyErr.StatusCode != 0 {
-			w.WriteHeader(caddyErr.StatusCode)
-		}
-		return caddyErr
-	}
-
-	// Certain errors we will not pass through
-	if caddyErr.StatusCode == http.StatusNotModified ||
-		caddyErr.StatusCode == http.StatusPreconditionFailed ||
-		caddyErr.StatusCode == http.StatusRequestedRangeNotSatisfiable {
-		w.WriteHeader(caddyErr.StatusCode)
-		return caddyErr
-	}
-
-	// process errors directive
-	doPassThrough, doS3ErrorPage, s3Key := p.determineErrorsAction(caddyErr.StatusCode)
-	if doPassThrough {
 		return next.ServeHTTP(w, r)
 	}
 
-	if caddyErr.StatusCode != 0 {
-		w.WriteHeader(caddyErr.StatusCode)
-	}
-	if doS3ErrorPage {
-		if err := p.serveErrorPage(w, s3Key); err != nil {
-			// Just log the error as we don't want to swallow the parent error.
-			p.log.Error("error serving error page",
-				zap.String("bucket", p.Bucket),
-				zap.String("key", s3Key),
-				zap.String("err", err.Error()),
-			)
-		}
-	}
-	return caddyErr
-}
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	fullPath := joinPath(repl.ReplaceAll(p.Root, ""), r.URL.Path)
 
-func (p S3Proxy) determineErrorsAction(statusCode int) (bool, bool, string) {
-	var s3Key string
-	if errorPageS3Key, hasErrorPageForCode := p.ErrorPages[statusCode]; hasErrorPageForCode {
-		s3Key = errorPageS3Key
-	} else if p.DefaultErrorPage != "" {
-		s3Key = p.DefaultErrorPage
+	var err error
+
+	err = p.GetHandler(w, r, fullPath)
+
+	if err == nil {
+		return nil
 	}
 
-	if strings.ToLower(s3Key) == "pass_through" {
-		return true, false, ""
-	}
-
-	return false, s3Key != "", s3Key
+	return next.ServeHTTP(w, r)
 }
 
 func (p S3Proxy) GetHandler(w http.ResponseWriter, r *http.Request, fullPath string) error {
-	// If file is hidden - return 404
-	if fileHidden(fullPath, p.Hide) {
-		return caddyhttp.Error(http.StatusNotFound, nil)
-	}
-
-	isDir := strings.HasSuffix(fullPath, "/")
 	var obj *s3.GetObjectOutput
 	var err error
+	var defaultIndex = "defaultIndex.html"
+	var s3Key = fullPath
 
-	if isDir && len(p.IndexNames) > 0 {
-		for _, indexPage := range p.IndexNames {
-			indexPath := path.Join(fullPath, indexPage)
-			obj, err = p.getS3Object(p.Bucket, indexPath, r.Header)
-
-			if err != nil {
-				p.log.Warn("failed to get object",
-					zap.String("bucket", p.Bucket),
-					zap.String("key", fullPath),
-					zap.String("err", err.Error()),
-				)
-			}
-
-			if err == nil {
-				// We found an index!
-				isDir = false
-				break
-			} else {
-				logIt := true
-				if aerr, ok := err.(awserr.Error); ok {
-					// Getting no such key here could be rather common
-					// So only log a warning if we get any other type of error
-					if aerr.Code() != s3.ErrCodeNoSuchKey {
-						logIt = false
-					}
-				}
-				if logIt {
-					p.log.Warn("error when looking for index",
-						zap.String("bucket", p.Bucket),
-						zap.String("key", fullPath),
-						zap.String("err", err.Error()),
-					)
-				}
-			}
-		}
+	if strings.HasSuffix(fullPath, "/") { // If we have a trailing-slash, then use the defaultIndex
+		s3Key = path.Join(s3Key, defaultIndex)
 	}
 
-	// If this is still a dir then browse or throw an error
-	if isDir {
-		if p.EnableBrowse {
-			return p.BrowseHandler(w, r, fullPath)
-		} else {
-			err = errors.New("can not view a directory")
-			return caddyhttp.Error(http.StatusForbidden, err)
-		}
+	if len(r.URL.RawQuery) > 0 { // RawQuery is converted to sha1() and put in a subdirectory
+		s3Key = path.Join(s3Key, "/", convertSha1(r.URL.RawQuery))
 	}
 
-	// Get the obj from S3 (skip if we already did when looking for an index)
-	if obj == nil {
-		obj, err = p.getS3Object(p.Bucket, fullPath, r.Header)
-	}
+	obj, err = p.getS3Object(p.Bucket, s3Key, r, w)
 	if err != nil {
-		caddyErr := convertToCaddyError(err)
-		if caddyErr.StatusCode == http.StatusNotFound {
-			// Log as debug as this one may be qute common
-			p.log.Debug("not found",
-				zap.String("bucket", p.Bucket),
-				zap.String("key", fullPath),
-				zap.String("err", caddyErr.Error()),
-			)
-		} else {
-			p.log.Error("failed to get object",
-				zap.String("bucket", p.Bucket),
-				zap.String("key", fullPath),
-				zap.String("err", caddyErr.Error()),
-			)
-		}
-
-		return caddyErr
+		return err
 	}
 
 	return p.writeResponseFromGetObject(w, obj)
 }
 
+func convertSha1(in string) string {
+	h := sha1.New()
+	h.Write([]byte(in))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 func setStrHeader(w http.ResponseWriter, key string, value *string) {
 	if value != nil && len(*value) > 0 {
-		w.Header().Add(key, *value)
+		w.Header().Set(key, *value)
 	}
 }
 
 func setTimeHeader(w http.ResponseWriter, key string, value *time.Time) {
 	if value != nil && !reflect.DeepEqual(*value, time.Time{}) {
-		w.Header().Add(key, value.UTC().Format(http.TimeFormat))
+		w.Header().Set(key, value.UTC().Format(http.TimeFormat))
 	}
-}
-
-// fileHidden returns true if filename is hidden
-// according to the hide list.
-func fileHidden(filename string, hide []string) bool {
-	sep := string(filepath.Separator)
-	var components []string
-
-	for _, h := range hide {
-		if !strings.Contains(h, sep) {
-			// if there is no separator in h, then we assume the user
-			// wants to hide any files or folders that match that
-			// name; thus we have to compare against each component
-			// of the filename, e.g. hiding "bar" would hide "/bar"
-			// as well as "/foo/bar/baz" but not "/barstool".
-			if len(components) == 0 {
-				components = strings.Split(filename, sep)
-			}
-			for _, c := range components {
-				if c == h {
-					return true
-				}
-			}
-		} else if strings.HasPrefix(filename, h) {
-			// otherwise, if there is a separator in h, and
-			// filename is exactly prefixed with h, then we
-			// can do a prefix match so that "/foo" matches
-			// "/foo/bar" but not "/foobar".
-			withoutPrefix := strings.TrimPrefix(filename, h)
-			if strings.HasPrefix(withoutPrefix, sep) {
-				return true
-			}
-		}
-
-		// in the general case, a glob match will suffice
-		if hidden, _ := filepath.Match(h, filename); hidden {
-			return true
-		}
-	}
-
-	return false
 }
