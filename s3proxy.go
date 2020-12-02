@@ -323,7 +323,7 @@ func (p S3Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 func (p S3Proxy) GetHandler(w http.ResponseWriter, r *http.Request, fullPath string) error {
 	var obj *s3.GetObjectOutput
 	var err error
-	var defaultIndex = "defaultIndex.html"
+	var defaultIndex = "index.html"
 	var s3Key = fullPath
 
 	if strings.HasSuffix(fullPath, "/") { // If we have a trailing-slash, then use the defaultIndex
