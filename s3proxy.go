@@ -3,8 +3,14 @@ package caddys3proxy
 import (
 	"crypto/sha1"
 	"encoding/hex"
-	"fmt"
+	"errors"
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"go.uber.org/zap"
 	"html/template"
 	"io"
 	"net/http"
@@ -12,16 +18,7 @@ import (
 	"reflect"
 	"strings"
 	"time"
-
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"go.uber.org/zap"
 )
-
-var defaultIndexNames = []string{"index.html", "index.txt"}
 
 func init() {
 	caddy.RegisterModule(S3Proxy{})
@@ -41,33 +38,6 @@ type S3Proxy struct {
 
 	// Use non-standard endpoint for S3
 	Endpoint string `json:"endpoint,omitempty"`
-
-	// The names of files to try as index files if a folder is requested.
-	IndexNames []string `json:"index_names,omitempty"`
-
-	// A glob pattern used to hide matching key paths (returning a 404)
-	Hide []string
-
-	// Flag to determine if PUT operations are allowed (default false)
-	EnablePut bool
-
-	// Flag to determine if DELETE operations are allowed (default false)
-	EnableDelete bool
-
-	// Flag to enable browsing of "directories" in S3 (paths that end with a /)
-	EnableBrowse bool
-
-	// Path to a template file to use for generating browse dir html page
-	BrowseTemplate string
-
-	// Mapping of HTTP error status to S3 keys or pass through option.
-	ErrorPages map[int]string `json:"error_pages,omitempty"`
-
-	// S3 key to a default error page or pass through option.
-	DefaultErrorPage string `json:"default_error_page,omitempty"`
-
-	// Set this to `true` to force the request to use path-style addressing.
-	S3ForcePathStyle bool `json:"force_path_style,omitempty"`
 
 	// Set this to `true` to enable S3 Accelerate feature.
 	S3UseAccelerate bool `json:"use_accelerate,omitempty"`
@@ -92,32 +62,6 @@ func (p *S3Proxy) Provision(ctx caddy.Context) (err error) {
 		p.Root = "{http.vars.root}"
 	}
 
-	if p.IndexNames == nil {
-		p.IndexNames = defaultIndexNames
-	}
-
-	if p.ErrorPages == nil {
-		p.ErrorPages = make(map[int]string)
-	}
-
-	if p.EnableBrowse {
-		var tpl *template.Template
-		var err error
-
-		if p.BrowseTemplate != "" {
-			tpl, err = template.ParseFiles(p.BrowseTemplate)
-			if err != nil {
-				return fmt.Errorf("parsing browse template file: %v", err)
-			}
-		} else {
-			tpl, err = template.New("default_listing").Parse(defaultBrowseTemplate)
-			if err != nil {
-				return fmt.Errorf("parsing default browse template: %v", err)
-			}
-		}
-		p.dirTemplate = tpl
-	}
-
 	var config aws.Config
 
 	// If Region is not specified NewSession will look for it from an env value AWS_REGION
@@ -127,10 +71,6 @@ func (p *S3Proxy) Provision(ctx caddy.Context) (err error) {
 
 	if p.Endpoint != "" {
 		config.Endpoint = aws.String(p.Endpoint)
-	}
-
-	if p.S3ForcePathStyle {
-		config.S3ForcePathStyle = aws.Bool(p.S3ForcePathStyle)
 	}
 
 	if p.S3UseAccelerate {
@@ -151,11 +91,6 @@ func (p *S3Proxy) Provision(ctx caddy.Context) (err error) {
 	p.log.Debug("config values",
 		zap.String("endpoint", p.Endpoint),
 		zap.String("region", p.Region),
-		zap.Bool("enable_put", p.EnablePut),
-		zap.Bool("enable_delete", p.EnableDelete),
-		zap.String("default_error_page", p.DefaultErrorPage),
-		zap.Bool("enable_browse", p.EnableBrowse),
-		zap.Bool("force_path_style", p.S3ForcePathStyle),
 		zap.Bool("use_accelerate", p.S3UseAccelerate),
 	)
 
@@ -195,7 +130,6 @@ func (p S3Proxy) getS3Object(bucket string, key string, r *http.Request, w http.
 		zap.String("key", key),
 	)
 
-	//
 	obj, err := p.client.GetObject(oi)
 
 	if err != nil {
@@ -237,6 +171,16 @@ func (p S3Proxy) getS3Object(bucket string, key string, r *http.Request, w http.
 		}
 
 		return obj, err
+	}
+
+	if *obj.ContentLength == 0 {
+		p.log.Error("cache:fail",
+			zap.String("bucket", bucket),
+			zap.String("key", key),
+			zap.String("error", "ContentLength is empty"),
+		)
+
+		return obj, errors.New("ContentLength is empty - cache is ")
 	}
 
 	p.log.Debug("cache:hit",
